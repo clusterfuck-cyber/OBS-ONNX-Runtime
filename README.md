@@ -33,12 +33,6 @@ Copy all three DLLs to the OBS Studio plugin directory:
 C:\Program Files\obs-studio\obs-plugins\64bit\
 ```
 
-The easiest way is to run the provided installer script from the project root:
-
-```powershell
-.\install_latest_build.ps1
-```
-
 ## Requirements
 
 | Requirement | Minimum |

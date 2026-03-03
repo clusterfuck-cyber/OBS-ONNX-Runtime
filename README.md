@@ -49,7 +49,6 @@ C:\Program Files\obs-studio\obs-plugins\64bit\
 - **Build type**: RelWithDebInfo
 - **ONNX Runtime**: `onnxruntime-win-x64-directml-1.19.0`
 - **DirectML SDK**: `DirectML-1.15.1`
-- **Source**: `E:\_DEV\OBSPlugins\obs-onnx-plugin`
 
 ## Dependency Chain
 

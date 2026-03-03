@@ -1,4 +1,4 @@
-# OBS ONNX Plugin – Staging Directory
+# OBS ONNX Plugin
 
 This directory contains the runtime binaries required to deploy the **OBS ONNX Plugin** (DirectML build).
 

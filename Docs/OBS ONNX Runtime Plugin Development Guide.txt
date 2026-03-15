@@ -1,0 +1,503 @@
+﻿High-Performance Integrated Computer Vision Systems in Broadcasting: A Technical Framework for OBS Studio Plugin Development on Windows 11
+Executive Summary
+The convergence of professional broadcasting software and edge artificial intelligence (AI) has created a demand for high-fidelity, real-time video manipulation capabilities. This report presents a comprehensive technical framework for developing a custom plugin for Open Broadcaster Software (OBS) Studio, specifically engineered for the Windows 11 operating system. The primary objective is to integrate the ONNX Runtime (ORT) inference engine to perform computer vision tasks—such as semantic segmentation, object detection, or style transfer—directly within the broadcast pipeline.
+The target hardware environment consists of an Intel Core i5 (latest generation), 32GB of system RAM, and an NVIDIA GeForce RTX 3050 GPU. A critical operational constraint is the dedicated nature of the system: no other applications will run concurrently, permitting aggressive resource allocation strategies that would otherwise be unsafe in multi-tenant environments.
+This document serves as a definitive implementation guide for systems architects and developers. It moves beyond high-level abstractions to address the specific interoperability challenges between OBS’s graphics subsystem (Direct3D 11), the CUDA compute architecture, and the ONNX Runtime C++ API. Central to this architecture is the implementation of a "Zero-Copy" pipeline, which eliminates the latency-inducing transfer of uncompressed video frames across the PCIe bus by keeping data resident in Video Random Access Memory (VRAM) throughout the entire processing lifecycle.
+The report details the configuration of the development toolchain (CMake, Visual Studio Build Tools 2022, Visual Studio Code), the mathematical modeling of system bandwidth, the internal architecture of libobs, and the precise code structures required to bridge the gap between graphics rendering and tensor processing.
+________________
+1. Architectural Foundations and Hardware Analysis
+The design of real-time video processing systems is fundamentally a game of bandwidth management and latency minimization. Before writing code, one must understand the physical and logical constraints of the target hardware and the operating system's abstraction layers.
+1.1 Hardware Capability Analysis
+The specified hardware profile—Intel i5, 32GB RAM, RTX 3050—represents a capable mid-range workstation. Understanding the bottlenecks of this specific configuration is crucial for architectural decisions.
+1.1.1 The GPU: NVIDIA GeForce RTX 3050
+The RTX 3050 is based on the Ampere architecture. While it supports modern features like Ray Tracing and Tensor Cores, it sits at the entry level of the 30-series hierarchy.
+* Compute Units: It typically features 2,560 CUDA cores. For general-purpose matrix multiplication (GEMM) operations used in AI, this provides substantial throughput, but it is easily saturated by high-resolution models.
+* Memory Interface: The card utilizes a 128-bit memory bus with GDDR6 memory, yielding a theoretical bandwidth of approximately 224 GB/s. This is the primary constraint. A 4K RGBA frame requires ~32MB. Reading and writing this data repeatedly for inference can quickly consume this bandwidth, competing with the OBS compositor which also utilizes the GPU for rendering scenes.
+* Tensor Cores: The presence of dedicated Tensor Cores allows for mixed-precision (FP16) inference. Utilizing FP16 is not merely an optimization; it is a requirement to double the effective throughput and halve the memory footprint for tensor storage, which is critical given the RTX 3050’s limited VRAM (typically 8GB on desktop variants).
+1.1.2 The CPU: Intel Core i5 (Last Gen)
+Modern i5 processors (e.g., 13600K or 14600K) utilize a hybrid architecture consisting of Performance-cores (P-cores) and Efficient-cores (E-cores).
+* Implication for OBS: OBS Studio is heavily multi-threaded. The video encoding thread (if using x264) and the graphics thread are latency-sensitive.
+* Host-to-Device Bottleneck: While the CPU is powerful, the link to the GPU is limited by the PCIe bus. Even with PCIe Gen 4.0, the latency of moving data from system RAM to VRAM is orders of magnitude higher than moving data within VRAM.
+* Strategy: The CPU’s role in this plugin must be strictly managerial. It should handle the orchestration of OBS callbacks and ONNX Runtime session management but must never touch the raw pixel data during the render loop.
+1.1.3 Memory: 32GB RAM
+With 32GB of system RAM, we have ample headroom for buffering models and OBS states. However, the "No Other App" constraint implies we can utilize this RAM for aggressive caching of model weights or pre-allocated pinned memory buffers (Page-Locked Memory) if CPU-GPU transfers become necessary for side-channel data (e.g., bounding box coordinates for UI overlays).
+1.2 The Zero-Copy Imperative
+In a naive plugin implementation, the data flow for a single frame often looks like this:
+1. VRAM Read: OBS renders the source to a texture.
+2. Download: The plugin downloads the texture to CPU RAM (obs_source_get_frame).
+3. Convert: CPU converts BGRA to RGB Planar (NCHW).
+4. Upload: CPU uploads the tensor to GPU for inference.
+5. Inference: GPU computes the result.
+6. Download: GPU sends the result mask back to CPU.
+7. Upload: CPU uploads the mask to a texture for blending.
+Latency Calculation:
+For a 1080p60 stream (1920x1080, 4 bytes/pixel), one frame is ~8.3 MB.
+* 4 PCIe transfers x 8.3 MB = ~33.2 MB per frame.
+* At 60 FPS, this is ~2 GB/s of continuous PCIe traffic.
+While this is within the bandwidth limits of PCIe Gen 4, the latency of these transfers, coupled with the synchronization overhead (CPU waiting for GPU, GPU waiting for CPU), inevitably leads to frame jitter and missed deadlines (rendering > 16.6ms).
+The Zero-Copy Architecture:
+The proposed architecture eliminates the PCIe traversals entirely for the video data:
+   1. Interop: The plugin obtains the D3D11 texture handle from OBS.
+   2. Map: The texture is mapped into the CUDA address space.
+   3. Compute: A CUDA kernel reads the texture and writes directly to the AI model's input tensor (in VRAM).
+   4. Inference: ONNX Runtime executes on the GPU.
+   5. Render: A CUDA kernel writes the output to a D3D11 texture.
+This approach reduces the per-frame PCIe traffic to effectively zero (only command buffers and scalar parameters are transferred), maximizing the RTX 3050's internal bandwidth efficiency.
+________________
+2. The Development Environment Ecosystem
+Building a native C++ plugin for OBS on Windows requires a precise alignment of compiler versions, build tools, and library dependencies. The "Visual Studio Build Tools 2022" and "CMake" requirement dictates a modern, generator-based build process.
+2.1 The Toolchain Matrix
+
+
+Component
+	Version Requirement
+	Justification
+	Operating System
+	Windows 11 (64-bit)
+	Supports WDDM 3.x and latest DirectX 12/11 interoperability features.
+	Compiler
+	MSVC v143 (VS 2022)
+	OBS Studio is built with MSVC 2022. Binary compatibility (ABI) is required for C++ objects.1
+	Build System
+	CMake 3.24+
+	Required to configure the obs-plugintemplate and handle complex dependency lookup.3
+	IDE
+	Visual Studio Code
+	Lightweight, extensible environment. Configurable via c_cpp_properties.json.
+	AI Engine
+	ONNX Runtime 1.17+ (GPU)
+	Provides the C++ API and CUDA Execution Provider.4
+	Compute SDK
+	CUDA Toolkit 11.8 or 12.x
+	Must match the version ONNX Runtime was compiled against.4
+	Host Application
+	OBS Studio 30.x+
+	Provides libobs.dll and headers.
+	2.2 Setting Up the Project Structure
+The project should follow a canonical structure that separates source code, external dependencies, and build artifacts. We will leverage the obs-plugintemplate structure but modify it for AI integration.
+ProjectRoot/
+├── CMakeLists.txt # Master build configuration
+├──.vscode/
+│ ├── c_cpp_properties.json # Intellisense configuration
+│ ├── launch.json # Debugger automation
+│ └── tasks.json # Build tasks
+├── external/
+│ ├── onnxruntime-win-x64-gpu/ # Extracted ONNX Runtime binaries
+│ └── obs-studio/ # Cloned OBS source (for headers)
+├── src/
+│ ├── plugin-main.cpp # Entry point (obs_module_load)
+│ ├── filter-source.hpp # Filter class definition
+│ ├── filter-source.cpp # OBS callback implementations
+│ ├── ai-engine.hpp # ONNX Runtime wrapper class
+│ ├── ai-engine.cpp # Inference logic
+│ └── gpu-interop.cu # CUDA kernels for format conversion
+└── data/
+└── locale/ # Localization files
+└── en-US.ini
+2.3 Configuring CMake for Dependency Resolution
+One of the most common failure points in OBS plugin development is the CMake configuration failing to locate LibObs or external libraries like ONNX Runtime.3 We must manually define these paths in CMakeLists.txt to ensure robustness.
+The CMakeLists.txt Implementation:
+
+
+CMake
+
+
+
+
+cmake_minimum_required(VERSION 3.24)
+
+project(obs-ai-filter VERSION 0.1.0 LANGUAGES CXX CUDA)
+
+# C++ Standard: Modern OBS requires C++17 or C++20. 
+# We use C++20 for better standard library support.
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# --- Configuration Variables ---
+set(OBS_OUTPUT_DIR "${CMAKE_BINARY_DIR}/rundir")
+set(CMAKE_INSTALL_PREFIX "${OBS_OUTPUT_DIR}")
+
+# --- Dependencies: LibObs ---
+# The user must provide LIBOBS_INCLUDE_DIR and LIBOBS_LIB path via CMake presets or CLI
+if(NOT TARGET obs::libobs)
+   find_package(LibObs REQUIRED)
+endif()
+
+# --- Dependencies: ONNX Runtime ---
+# We use an IMPORTED target to link against the pre-built DLLs
+set(ORT_ROOT "${CMAKE_SOURCE_DIR}/external/onnxruntime-win-x64-gpu")
+add_library(onnxruntime SHARED IMPORTED)
+set_target_properties(onnxruntime PROPERTIES
+   IMPORTED_LOCATION "${ORT_ROOT}/lib/onnxruntime.dll"
+   IMPORTED_IMPLIB "${ORT_ROOT}/lib/onnxruntime.lib"
+   INTERFACE_INCLUDE_DIRECTORIES "${ORT_ROOT}/include"
+)
+
+# --- Dependencies: CUDA ---
+find_package(CUDAToolkit REQUIRED)
+
+# --- Plugin Library Definition ---
+add_library(${PROJECT_NAME} MODULE
+   src/plugin-main.cpp
+   src/filter-source.cpp
+   src/ai-engine.cpp
+   src/gpu-interop.cu
+)
+
+# --- Include Directories ---
+target_include_directories(${PROJECT_NAME} PRIVATE
+   src
+   ${ORT_ROOT}/include
+   ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+# --- Link Libraries ---
+target_link_libraries(${PROJECT_NAME} PRIVATE
+   obs::libobs
+   onnxruntime
+   CUDA::cudart
+   d3d11
+   dxgi
+)
+
+# --- Post-Build Events ---
+# OBS requires the plugin DLL to be in a specific folder structure.
+# Also, we must copy the ONNX Runtime DLLs next to our plugin.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+   "${ORT_ROOT}/lib/onnxruntime.dll"
+   "$<TARGET_FILE_DIR:${PROJECT_NAME}>/onnxruntime.dll"
+   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+   "${ORT_ROOT}/lib/onnxruntime_providers_cuda.dll"
+   "$<TARGET_FILE_DIR:${PROJECT_NAME}>/onnxruntime_providers_cuda.dll"
+   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+   "${ORT_ROOT}/lib/onnxruntime_providers_shared.dll"
+   "$<TARGET_FILE_DIR:${PROJECT_NAME}>/onnxruntime_providers_shared.dll"
+   COMMENT "Copying ONNX Runtime dependencies..."
+)
+
+Insight: The add_library(... MODULE...) command is specific to plugins. It tells CMake to create a library that is meant to be loaded dynamically at runtime (via LoadLibrary), preventing it from being linked against at build time by other targets.
+2.4 Visual Studio Code Configuration
+To debug effectively, VS Code must be configured to attach to the OBS process. Since OBS loads the plugin DLL, we cannot "launch" the DLL directly.
+launch.json Configuration:
+
+
+JSON
+
+
+
+
+{
+   "version": "0.2.0",
+   "configurations":,
+           "cwd": "C:\\Program Files\\obs-studio\\bin\\64bit",
+           "environment":,
+           "console": "integratedTerminal"
+       }
+   ]
+}
+
+Critical Setup Note: The environment block is essential. OBS needs to find your compiled plugin and the ONNX Runtime DLLs. By modifying the PATH environment variable for the debug session, we ensure that when obs64.exe tries to load obs-ai-filter.dll, the Windows loader can resolve the dependency on onnxruntime.dll.6
+________________
+3. The OBS Plugin API (LibObs) Internals
+Deep understanding of libobs is required to manipulate video frames efficiently. OBS uses a C-based object-oriented design pattern where structures containing function pointers define the behavior of objects.
+3.1 Anatomy of a Video Filter
+We are implementing a Filter Source (OBS_SOURCE_TYPE_FILTER). Filters are unique because they have an input (the parent source) and an output. They form a linked list in the rendering pipeline.
+The obs_source_info Structure: This structure defines the lifecycle of our plugin.8
+
+
+C++
+
+
+
+
+struct obs_source_info ai_filter_info = {
+  .id = "ai_segmentation_filter",
+  .type = OBS_SOURCE_TYPE_FILTER,
+  .output_flags = OBS_SOURCE_VIDEO,
+  .get_name = GetName,
+  .create = Create,
+  .destroy = Destroy,
+  .update = Update,
+  .video_render = VideoRender,
+  .video_tick = VideoTick
+};
+
+3.1.1 The Lifecycle Callbacks
+   * create: Allocates the plugin's data structure (struct ai_filter_data). This is where we initialize the ONNX Runtime environment and allocate initial CUDA resources.
+   * destroy: Frees resources. It is critical to release CUDA handles (cudaGraphicsUnregisterResource) and destroy ONNX sessions here to prevent VRAM leaks.
+   * update: Called when the user changes settings in the UI properties. If the user selects a new model, we unload the old session and load the new one here.
+   * video_tick: Called every frame, but typically used for logic updates rather than rendering. We can use this to calculate timing deltas.
+   * video_render: The core rendering loop. This function is called by the graphics thread. It is responsible for drawing the source.
+3.2 The Graphics Subsystem (libobs/graphics)
+OBS abstracts the underlying graphics API (D3D11 on Windows, OpenGL on Linux/macOS) via the gs_ (Graphics Subsystem) prefix functions.
+Key Data Types:
+   * gs_texture_t: An opaque handle representing a GPU texture.
+   * gs_effect_t: Represents a shader effect (HLSL/GLSL).
+   * gs_texrender_t: A helper object for rendering to an intermediate texture.
+The Graphics Context:
+OBS executes rendering on a dedicated thread. Functions that touch the GPU must be called within a valid graphics context.
+   * obs_enter_graphics() / obs_leave_graphics(): These functions acquire the graphics lock. They are required if you need to perform GPU operations outside of video_render (e.g., during initialization in create or update).10
+   * Inside video_render: The lock is already held. Calling obs_enter_graphics here will cause a recursive lock or deadlock depending on implementation.
+3.3 Synchronous vs. Asynchronous Filters
+There are two ways to implement video filters in OBS:
+   1. filter_video (Async): The plugin receives a struct obs_source_frame containing raw CPU memory (system RAM). This is suitable for CPU-based filters but disastrous for our Zero-Copy goal because it implies the data has already been downloaded from the GPU.11
+   2. video_render (Sync): The plugin is part of the draw chain. It has access to the GPU texture directly. This is the correct approach for high-performance GPU AI. We intercept the draw call, grab the texture, process it with CUDA, and then draw the result.11
+________________
+4. Direct3D 11 and CUDA Interoperability
+This chapter details the mechanisms to bridge the gap between OBS's rendering engine (Direct3D 11) and the AI engine (CUDA).
+4.1 The Format Mismatch Challenge
+OBS typically renders internally using the GS_RGBA format, which maps to DXGI_FORMAT_B8G8R8A8_UNORM (BGRA) on Windows.14
+   * Layout: Packed (B, G, R, A interleaved).
+   * Data Type: 8-bit Unsigned Integer (0-255).
+Most ONNX computer vision models (e.g., ResNet, YOLO, UNet) expect:
+   * Layout: Planar (RRR..., GGG..., BBB...).
+   * Data Type: 32-bit Floating Point (0.0 - 1.0).
+   * Dimensions: NCHW (Batch, Channels, Height, Width).
+We cannot simply pass the D3D11 pointer to ONNX Runtime; the model will interpret the packed bytes as garbage float values. We need a "Pre-processing Kernel."
+4.2 Resource Registration and Mapping
+To modify or read a D3D11 texture in CUDA, we use the CUDA Driver API's interoperability functions.
+Step 1: Extracting the ID3D11Texture2D
+The gs_texture_t is an opaque wrapper. We need the underlying pointer.
+
+
+C++
+
+
+
+
+// Within VideoRender context
+gs_texture_t *obs_tex = gs_texrender_get_texture(filter->texrender);
+ID3D11Texture2D *d3d11_tex = (ID3D11Texture2D *)gs_texture_get_obj(obs_tex);
+
+Citation: gs_texture_get_obj returns the platform-specific handle.15
+Step 2: Registering with CUDA
+This must be done only once (or whenever the texture changes).
+
+
+C++
+
+
+
+
+cudaGraphicsResource_t cuda_resource;
+// Register the D3D11 resource for CUDA access.
+// cudaGraphicsRegisterFlagsNone: We might read and write.
+cudaGraphicsD3D11RegisterResource(&cuda_resource, d3d11_tex, cudaGraphicsRegisterFlagsNone);
+
+Step 3: Mapping for Access
+Inside the render loop, we map the resource to get a CUDA-compatible pointer.
+
+
+C++
+
+
+
+
+cudaGraphicsMapResources(1, &cuda_resource, 0);
+cudaArray_t texture_array;
+cudaGraphicsSubResourceGetMappedArray(&texture_array, cuda_resource, 0, 0);
+
+4.3 The CUDA Kernels
+We require a .cu file compiled by nvcc to perform the heavy lifting.
+4.3.1 Surface Objects
+We bind the cudaArray_t to a Surface Object to enable surf2Dread and surf2Dwrite. Textures are read-only caches; Surfaces allow read/write and are generally preferred for this type of manipulation.16
+4.3.2 Pre-Processing Kernel (BGRA -> NCHW Float)
+
+
+C++
+
+
+
+
+// gpu-interop.cu
+__global__ void PreprocessKernel(
+   cudaSurfaceObject_t input_surface, 
+   float* output_tensor, 
+   int width, int height)
+{
+   unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+   unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+   if (x < width && y < height) {
+       // Read packed BGRA byte (uchar4)
+       uchar4 pixel;
+       surf2Dread(&pixel, input_surface, x * 4, y);
+
+       // Calculate planar offsets
+       int pixel_index = y * width + x;
+       int stride = width * height;
+
+       // Normalize (0-255 -> 0.0-1.0) and Split Channels
+       // Note: OBS usually uses BGRA, verify if model needs RGB or BGR
+       // Assuming Model needs RGB:
+       output_tensor[pixel_index]              = (float)pixel.z / 255.0f; // R
+       output_tensor[pixel_index + stride]     = (float)pixel.y / 255.0f; // G
+       output_tensor[pixel_index + stride * 2] = (float)pixel.x / 255.0f; // B
+   }
+}
+
+Insight: This kernel performs normalization, type conversion, and layout transposition in a single memory pass. This is orders of magnitude faster than doing it on the CPU.
+________________
+5. The ONNX Runtime (ORT) Integration
+With the data prepared in a CUDA float buffer (output_tensor from the kernel above), we invoke the AI engine.
+5.1 Session Initialization and Configuration
+The "No Other App" constraint allows us to be generous with GPU memory. However, the RTX 3050 typically has 8GB VRAM (desktop) or 4GB (laptop). We must configure the session to avoid Out-Of-Memory (OOM) errors, which would crash OBS.
+
+
+C++
+
+
+
+
+// ai-engine.cpp
+
+AiEngine::AiEngine(const std::wstring& model_path) {
+   Ort::SessionOptions session_options;
+   
+   // Graph Optimization: Fuse layers (Conv+Bn+Relu) for speed
+   session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+   
+   // CUDA Provider Options
+   OrtCUDAProviderOptions cuda_options;
+   cuda_options.device_id = 0;
+   
+   // Memory Strategy:
+   // "arena_extend_strategy": kSameAsRequested (0) or kNextPowerOfTwo (1).
+   // On limited VRAM (RTX 3050), kSameAsRequested is safer to avoid fragmentation.
+   cuda_options.arena_extend_strategy = 0; 
+   
+   // Limit memory if necessary (e.g., keep 2GB for OBS)
+   // cuda_options.gpu_mem_limit = 2 * 1024 * 1024 * 1024; 
+   
+   session_options.AppendExecutionProvider_CUDA(cuda_options);
+   
+   _env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "OBS_AI_Plugin");
+   _session = std::make_unique<Ort::Session>(*_env, model_path.c_str(), session_options);
+}
+
+5.2 Zero-Copy Inference with Ort::IoBinding
+The standard session->Run() API often assumes CPU inputs. To use our GPU-resident data, we must use Ort::IoBinding.18
+
+
+C++
+
+
+
+
+void AiEngine::RunInference(float* d_input_tensor, float* d_output_tensor) {
+   Ort::IoBinding binding(*_session);
+   
+   // Define Memory Info: Data is on GPU (Cuda)
+   Ort::MemoryInfo mem_info("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+   
+   // Bind Input: Point ORT to our pre-processing kernel's output buffer
+   binding.BindInput(
+       _input_names.c_str(), 
+       _input_shape, 
+       mem_info, 
+       (void*)d_input_tensor, 
+       _input_tensor_size_bytes
+   );
+   
+   // Bind Output: Point ORT to our post-processing kernel's input buffer
+   binding.BindOutput(
+       _output_names.c_str(), 
+       mem_info, 
+       (void*)d_output_tensor, 
+       _output_tensor_size_bytes
+   );
+   
+   // Run Sync (because we are inside video_render)
+   _session->Run(Ort::RunOptions{nullptr}, binding);
+}
+
+Analysis: This code binds the ONNX Runtime execution graph directly to the pointers allocated via cudaMalloc in our setup phase. The data never leaves VRAM.
+________________
+6. Implementation Strategy and Code Architecture
+This chapter synthesizes the components into a cohesive plugin logic.
+6.1 Handling Resolution Changes
+OBS sources can change resolution dynamically (e.g., user resizes a game window). The plugin must handle this robustly.
+In VideoRender, check dimensions:
+
+
+C++
+
+
+
+
+uint32_t width = obs_source_get_width(target);
+uint32_t height = obs_source_get_height(target);
+
+if (width!= filter->width |
+
+| height!= filter->height) {
+   // Resolution changed!
+   // 1. Unregister old CUDA resources
+   // 2. Free old CUDA buffers (cudaFree)
+   // 3. Resize internal textures
+   // 4. Allocate new CUDA buffers (cudaMalloc)
+   // 5. Register new textures
+   filter->width = width;
+   filter->height = height;
+}
+
+Warning: Re-allocation is slow. This will cause a frame drop or two, but it is necessary.
+6.2 The Rendering Loop Implementation
+Here is the step-by-step logic for the VideoRender callback:
+   1. Preamble: Get the target source. If null, skip.
+   2. Context: obs_source_process_filter_begin. This renders the parent source into a texture (tex).
+   3. Interop Lock: cudaGraphicsMapResources on tex.
+   4. Pre-process: Launch PreprocessKernel (Texture -> Tensor A).
+   5. Inference: AiEngine::RunInference (Tensor A -> Tensor B).
+   6. Post-process: Launch PostprocessKernel (Tensor B -> Texture).
+   * Option A (Masking): Modify tex alpha channel directly based on inference output.
+   * Option B (Overlay): Write to a separate texture and blend using obs_source_draw.
+   7. Interop Unlock: cudaGraphicsUnmapResources.
+   8. Completion: obs_source_process_filter_end.
+6.3 Threading and Synchronization
+While the "No Other App" constraint implies we have free rein, we must respect the Windows Driver Model (WDDM). If a CUDA kernel takes too long (>2 seconds), Windows will reset the GPU driver (TDR).
+   * Safety: Ensure the model is optimized (INT8 or FP16).
+   * Fencing: While cudaGraphicsUnmapResources implies a synchronization point, explicit cudaStreamSynchronize might be needed before allowing OBS to present the frame to ensure the drawing is complete.
+________________
+7. Debugging, Profiling, and Optimization
+7.1 Debugging Techniques
+   * VS Code Attachment: Use the configuration in Section 2.4. Set breakpoints in VideoRender to inspect pointers.
+   * Dependency Walker: If the plugin fails to load, use "Dependencies" (a modern rewrite of Dependency Walker) on obs-ai-filter.dll. It will likely show missing onnxruntime.dll or cudart64_11.dll. Ensure the post-build CMake step copied them correctly.
+   * OBS Logs: Use blog(LOG_INFO, "...") liberally. These appear in the OBS Help -> Log File.
+7.2 Profiling with NVIDIA Nsight Systems
+To verify the Zero-Copy hypothesis:
+   1. Launch OBS via Nsight Systems.
+   2. Record a trace for 10 seconds.
+   3. Analyze the Timeline.
+   * Expectation: You should see a contiguous block of GPU activity: Graphics (OBS Render) -> Compute (Preprocess) -> Compute (TRT/CUDA Inference) -> Compute (Postprocess) -> Graphics (OBS Display).
+   * Failure Mode: Gaps in the GPU timeline with high CPU usage indicate hidden memcpy operations or driver synchronization stalls.
+7.3 Optimization for RTX 3050
+   * FP16 Inference: Convert the ONNX model to FP16. The RTX 3050 has efficient FP16 support. This reduces memory bandwidth pressure by 50% compared to FP32.
+   * Fixed Input Size: Even if the source is 4K, the AI model likely runs at 512x512 or 640x640. Downscale in the PreprocessKernel rather than running inference on the full resolution. This yields massive speedups.
+   * Kernel Update: Change the pre-processing kernel to perform bilinear interpolation while reading the texture, writing to a smaller 640x640 tensor.
+________________
+8. Conclusion
+This report has defined a rigorous path for implementing a real-time AI plugin for OBS Studio on Windows 11. By adhering to the Zero-Copy architecture and utilizing Direct3D-CUDA interoperability, developers can bypass the PCIe bandwidth bottleneck inherent in traditional CPU-based plugins.
+The specified hardware—Intel i5 and RTX 3050—is sufficient for complex inference tasks provided that resources are managed strictly within VRAM. The use of CMake and Visual Studio Code provides a modern, robust development environment, while the detailed analysis of libobs internals ensures the plugin integrates seamlessly with the host application.
+This framework transforms the RTX 3050 from a simple rendering device into a powerful edge-AI processor, enabling broadcast features previously reserved for high-end production studios. The integration of ONNX Runtime via C++ represents the state-of-the-art in accessible, high-performance media processing.
+Sources des citations
+   1. Visual Studio 2022 Runtimes | OBS, consulté le janvier 22, 2026, https://obsproject.com/visual-studio-2022-runtimes
+   2. OBS Studio requires updated Microsoft Visual C++ 2022 Redistributables. Please run both of these installers in order to continue, consulté le janvier 22, 2026, https://obsproject.com/forum/threads/obs-studio-requires-updated-microsoft-visual-c-2022-redistributables-please-run-both-of-these-installers-in-order-to-continue.183101/
+   3. cmake | OBS Forums, consulté le janvier 22, 2026, https://obsproject.com/forum/tags/cmake/
+   4. Install ONNX Runtime | onnxruntime, consulté le janvier 22, 2026, https://onnxruntime.ai/docs/install/
+   5. Could NOT find Libobs (missing: LIBOBS_LIB LIBOBS_INCLUDE_DIR) #1 - GitHub, consulté le janvier 22, 2026, https://github.com/obsproject/obs-plugintemplate/issues/1
+   6. Visual Studio Code debug configuration, consulté le janvier 22, 2026, https://code.visualstudio.com/docs/debugtest/debugging-configuration
+   7. Attach to running processes with the debugger - Visual Studio (Windows) | Microsoft Learn, consulté le janvier 22, 2026, https://learn.microsoft.com/en-us/visualstudio/debugger/attach-to-running-processes-with-the-visual-studio-debugger?view=visualstudio
+   8. Welcome to OBS Studio's documentation! — OBS Studio 32.1.0 documentation, consulté le janvier 22, 2026, https://docs.obsproject.com/
+   9. obs-studio/plugins/obs-filters/obs-filters.c at master · obsproject/obs-studio - GitHub, consulté le janvier 22, 2026, https://github.com/obsproject/obs-studio/blob/master/plugins/obs-filters/obs-filters.c
+   10. Rendering Graphics — OBS Studio 32.1.0 documentation, consulté le janvier 22, 2026, https://docs.obsproject.com/graphics
+   11. Source API Reference (obs_source_t) - OBS Studio's documentation!, consulté le janvier 22, 2026, https://docs.obsproject.com/reference-sources
+   12. Grabbing frame from source (video capture device) | OBS Forums, consulté le janvier 22, 2026, https://obsproject.com/forum/threads/grabbing-frame-from-source-video-capture-device.48967/
+   13. Question / Help - Video Filter Effects | OBS Forums, consulté le janvier 22, 2026, https://obsproject.com/forum/threads/video-filter-effects.70799/
+   14. Core Graphics API - OBS Studio's documentation!, consulté le janvier 22, 2026, https://docs.obsproject.com/reference-libobs-graphics-graphics
+   15. obs-studio/libobs/graphics/graphics.h at master - GitHub, consulté le janvier 22, 2026, https://github.com/obsproject/obs-studio/blob/master/libobs/graphics/graphics.h
+   16. How to render Direct3D scene to texture, process it with CUDA and render result to screen?, consulté le janvier 22, 2026, https://stackoverflow.com/questions/77237723/how-to-render-direct3d-scene-to-texture-process-it-with-cuda-and-render-result
+   17. Direct write to D3D texture from kernel - Stack Overflow, consulté le janvier 22, 2026, https://stackoverflow.com/questions/67909709/direct-write-to-d3d-texture-from-kernel
+   18. ONNX Runtime Execution Providers, consulté le janvier 22, 2026, https://onnxruntime.ai/docs/execution-providers/
+   19. Ort::Value Struct Reference - ONNX Runtime, consulté le janvier 22, 2026, https://onnxruntime.ai/docs/api/c/struct_ort_1_1_value.html

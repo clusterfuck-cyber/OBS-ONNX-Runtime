@@ -1,0 +1,44 @@
+# Build directory (CMake output)
+build/
+out/
+
+# Visual Studio files
+.vs/
+*.vcxproj.user
+
+# Binary outputs
+*.dll
+*.lib
+*.exp
+*.pdb
+*.exe
+
+# CUDA compilation cache
+*.cubin
+*.ptx
+
+# CMake cache
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# IDE files
+.vscode/*.log
+.vscode/ipch/
+
+# ONNX Runtime cache
+*.cache
+*.trt
+*.engine
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+*~
+
+# Model files (optional - uncomment if you don't want to track models)
+# models/*.onnx
+
+# Windows thumbnail cache
+Thumbs.db

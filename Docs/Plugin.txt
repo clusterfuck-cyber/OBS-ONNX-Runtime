@@ -1,0 +1,251 @@
+Advanced Engineering Report: Architecting High-Performance AI Plugins for OBS Studio on Windows 11 using ONNX Runtime and DirectML
+1. Executive Introduction: The Convergence of Broadcasting and Neural Inference
+The landscape of digital broadcasting and live streaming has undergone a paradigm shift, moving from static frame composition to dynamic, content-aware video processing. Open Broadcaster Software (OBS) Studio, the ubiquitous open-source standard for streaming, is increasingly required to support sophisticated features previously reserved for post-production, such as semantic segmentation (background removal), style transfer, and super-resolution. While conventional Central Processing Unit (CPU) based image processing was sufficient for basic filtering, the computational demands of Convolutional Neural Networks (CNNs) and Transformer models necessitate a fundamental architectural evolution toward hardware-accelerated inference.
+This report presents an exhaustive technical analysis of developing native C++ plugins for OBS Studio on the Windows 11 platform, specifically leveraging the ONNX Runtime (ORT) and the Direct Machine Learning (DirectML) execution provider. The analysis addresses the critical engineering challenges inherent in this integration, most notably the interoperability between OBS Studio’s legacy DirectX 11 (D3D11) rendering pipeline and the DirectX 12 (D3D12) environment required for modern neural inference. By establishing a "Zero-Copy" video pipeline—where frame data remains resident in Video Random Access Memory (VRAM) throughout the transformation lifecycle—developers can achieve the strict 16.6ms frame time budget required for 60 FPS broadcasting.
+The scope of this document encompasses the entire development lifecycle: from the configuration of the CMake build system and the management of "DLL Hell" dependencies to the implementation of HLSL compute shaders for tensor layout conversion (RGBA to NCHW) and the intricate synchronization primitives required to prevent race conditions between asynchronous graphics queues.
+1.1 The Strategic Necessity of DirectML on Windows 11
+While the machine learning ecosystem offers various backends, including CUDA and TensorRT, DirectML represents the strategic optimum for client-side Windows applications distributed to a broad user base. DirectML serves as a high-performance, hardware-accelerated DirectX 12 library that abstracts the underlying hardware, providing vendor-agnostic acceleration across NVIDIA, AMD, and Intel Graphics Processing Units (GPUs).1
+The architecture of Windows 11 further reinforces this choice. With the introduction of the Windows AI artifacts and the Neural Processing Unit (NPU) integration in version 24H2, DirectML acts as the unified gateway to heterogeneous compute resources. Although Microsoft has indicated that DirectML is in "sustained engineering" in favor of the higher-level Windows ML (WinML) API for some use cases, the DirectML Execution Provider for ONNX Runtime remains the preferred low-level interface for C++ developers requiring granular control over resource management and execution scheduling.2 This distinction is vital for an OBS plugin, where the overhead of the Windows Runtime (WinRT) projection used by WinML can introduce unnecessary friction in a pure C/C++ environment.
+1.2 Architectural Constraints and Goals
+The primary engineering constraint for an OBS AI plugin is latency. A typical streaming setup involves a GPU running a resource-intensive 3D game, an encoder (NVENC/AMF) compressing the output, and OBS compositing scenes. The AI inference must interleave into this pipeline without causing frame drops or introducing perceptible desynchronization between audio and video.
+Consequently, the architectural goals defined in this report are:
+Zero System Memory Copying: Eliminating the transfer of texture data from GPU to CPU RAM.
+Asynchronous Execution: Decoupling the inference workload from the main OBS rendering thread.
+Cross-API Interoperability: Efficiently bridging the D3D11 context of OBS with the D3D12 context of DirectML.
+Robustness: Gracefully handling GPU device loss and driver resets.
+2. The Native Architecture of OBS Studio (libobs)
+Understanding the host environment is prerequisite to effective plugin design. OBS Studio is built upon libobs, a C-based library that provides the core abstractions for sources, outputs, encoders, and services. The plugin interface relies on a system of callbacks and structure definitions that allow external code to inject logic into the rendering pipeline.
+2.1 The Source API and Filter Pipeline
+In the vernacular of OBS, any element that produces audio or video is a "Source." A "Filter" is a specialized source that acts as a middleware layer, intercepting the output of a parent source, modifying it, and passing it to the compositor. The fundamental data structure defining a plugin is obs_source_info.4
+This structure dictates the behavior and capabilities of the plugin. For an AI-based video filter, the following members of obs_source_info are critical:
+.id: A unique string identifier preventing collisions with other plugins.
+.type: Must be set to OBS_SOURCE_TYPE_FILTER.
+.output_flags: A bitmask defining capabilities. Flags such as OBS_SOURCE_VIDEO indicate video data presence. Crucially, the flag OBS_SOURCE_ASYNC_VIDEO (or lack thereof) determines whether the source pushes frames asynchronously or is polled by the rendering loop.4
+.video_render: The primary callback for graphics operations. This function is invoked every frame within the context of the OBS graphics thread. It provides the mechanism to issue draw calls, bind shaders, and manipulate textures.
+2.2 The Graphics Subsystem (gs)
+OBS abstracts the platform-specific graphics API through its gs (graphics system) layer. On Windows, gs wraps DirectX 11. While this abstraction facilitates cross-platform development (mapping to OpenGL on Linux/macOS), it presents a barrier for DirectML integration. The gs functions generally return opaque handles (gs_texture_t), obscuring the underlying ID3D11Texture2D pointers required for interop.
+To bypass this abstraction for AI integration, the plugin must utilize platform-specific exports provided by libobs. Specifically, the function gs_texture_get_obj() is the gateway to the native API. On Windows, this function returns a void* that can be safely cast to ID3D11Texture2D*.5 This pointer is the handle to the resource residing in VRAM, which serves as the input for the neural network.
+2.3 The Rendering Loop Lifecycle
+The execution flow within video_render is time-critical. OBS expects this callback to return essentially immediately. If a plugin attempts to run a heavy inference model synchronously within video_render (e.g., calling session.Run() and waiting 20ms for completion), the entire OBS render thread stalls. This results in the entire stream freezing or stuttering, not just the webcam feed.
+Therefore, the libobs architecture implicitly mandates an asynchronous design for heavy compute tasks. The video_render callback should function merely as a state manager: checking if a processed frame is available in the output queue, rendering it if so, or rendering the original frame (or a transparent blank) if not, while simultaneously submitting new frames to a background worker thread.
+3. The Cross-API Interoperability Challenge: D3D11 to D3D12
+The central engineering challenge in this domain is the dichotomy between the host and the accelerator: OBS lives in DirectX 11, while DirectML requires DirectX 12. These are distinct API generations with incompatible device contexts, command queues, and resource management strategies.
+3.1 The Cost of the Naive Approach
+A naive implementation might attempt to bridge this gap via system memory:
+Download: Use ID3D11DeviceContext::Map to read the texture from GPU VRAM to CPU RAM.
+Transcode: Convert the format if necessary (e.g., removing padding).
+Upload: Use ID3D12GraphicsCommandList::CopyTextureRegion to move data from CPU RAM to a D3D12 resource in VRAM.
+This "round-trip" approach is catastrophic for performance. A 1080p frame (RGBA, 8-bit) is approximately 8.3 MB. Transferring this across the PCIe bus (even Gen 3 or 4) incurs significant latency, often exceeding 10-15ms per frame purely in data movement, consuming the entire frame budget before inference even begins.7 Furthermore, this saturates the CPU memory bandwidth, potentially degrading the performance of the game being streamed.
+3.2 The Zero-Copy Solution: Shared NT Handles
+The optimal solution leverages the DXGI (DirectX Graphics Infrastructure) resource sharing capabilities. Introduced in modern Windows iterations, CreateSharedHandle allows a GPU resource created in one device context to be accessed by another, provided they reside on the same physical adapter. This mechanism enables "Zero-Copy" sharing, where the D3D12 context reads the texture data directly from the memory allocated by the D3D11 context.7
+3.2.1 Resource Creation Flags
+The OBS-managed texture retrieved via gs_texture_get_obj is typically not created with sharing flags. Therefore, the plugin must create an intermediate "Interop Texture" in the D3D11 context. This texture must be initialized with specific flags:
+D3D11_RESOURCE_MISC_SHARED_NTHANDLE: Enables the creation of secure NT handles, which are preferred over legacy shared handles on Windows 11.
+D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX: Critical for synchronization. Since D3D11 and D3D12 execute on parallel command queues, concurrent access to the same memory address can lead to read-after-write hazards or visual corruption. The Keyed Mutex enforces exclusive access.7
+3.2.2 The Handle Handshake
+The process of establishing the link involves the following steps:
+Export (DX11): The plugin calls IDXGIResource1::CreateSharedHandle on the interop texture. This generates a HANDLE (similar to a file handle).
+Import (DX12): The plugin's DirectML subsystem calls ID3D12Device::OpenSharedHandle. This returns an ID3D12Resource* pointing to the same VRAM allocation.
+This handshake allows the DirectML execution provider to utilize the texture as an input tensor without moving a single byte of data across the PCIe bus.
+3.3 Synchronization Primitives
+Synchronizing the two graphics APIs is the most fragile component of the pipeline. The IDXGIKeyedMutex interface provides AcquireSync and ReleaseSync methods. The plugin must implement a strict "Ping-Pong" ownership model.
+State
+Owner
+Action
+Transition
+T0
+D3D11 (OBS)
+Copy frame from gs_texture to SharedTex.
+ReleaseSync(1)
+T1
+D3D12 (DML)
+Wait for Key 1. AcquireSync(1).
+Processing
+T2
+D3D12 (DML)
+Run Preprocessing & Inference.
+Processing
+T3
+D3D12 (DML)
+Inference Complete.
+ReleaseSync(0)
+T4
+D3D11 (OBS)
+Wait for Key 0. AcquireSync(0).
+Display
+
+Failure to correctly implement this sequence results in GPU hangs (Timeout Detection and Recovery - TDR), causing the screen to flash black or OBS to crash.10 It is imperative to perform AcquireSync with a timeout (e.g., 0ms or a small window) on the OBS thread to prevent freezing the UI if the AI thread hangs.
+4. ONNX Runtime Integration and Dependency Management
+Integrating ONNX Runtime into an OBS plugin involves navigating complex build systems and dependency trees. The library Microsoft.ML.OnnxRuntime.DirectML is the standard delivery mechanism, but its deployment requires careful handling.
+4.1 "DLL Hell" and Dependency Isolation
+A significant issue documented in the development of plugins like obs-backgroundremoval is the conflict between system-provided libraries and plugin dependencies. Windows ships with a version of DirectML.dll in System32. However, the ONNX Runtime often depends on a newer version of DirectML than the OS provides. If the plugin implicitly links to the system DirectML.dll, initialization may fail with obscure error codes.11
+To mitigate this, the plugin must utilize Side-by-Side Assembly or explicit local linking. The CMake build script should extract the DirectML.dll and onnxruntime.dll from the NuGet package and copy them to the plugin's binary directory. During runtime loading, the plugin creates an isolated environment (often managed by OBS's module loader) ensuring that ORT loads the adjacent, compatible DirectML.dll rather than the system version.
+4.2 NuGet Package Anatomy
+The Microsoft.ML.OnnxRuntime.DirectML package contains several artifacts that must be correctly routed in the CMakeLists.txt:
+runtimes/win-x64/native/onnxruntime.dll: The core engine.
+runtimes/win-x64/native/DirectML.dll: The matching hardware acceleration library.
+build/native/include: Header files (onnxruntime_cxx_api.h).
+build/native/lib: Import libraries (onnxruntime.lib).
+Table 1 illustrates the necessary file layout for a deployed plugin to ensure stability.
+Table 1: Plugin Deployment File Structure
+File
+Location
+Purpose
+my-obs-plugin.dll
+obs-studio/obs-plugins/64bit/
+The compiled plugin logic.
+onnxruntime.dll
+obs-studio/obs-plugins/64bit/
+The inference engine (pinned version).
+DirectML.dll
+obs-studio/obs-plugins/64bit/
+The hardware backend (pinned version).
+model.onnx
+obs-studio/data/obs-plugins/my-plugin/
+The neural network model file.
+preprocessing.cso
+obs-studio/data/obs-plugins/my-plugin/
+Compiled Compute Shader object.
+
+4.3 Session Initialization and Configuration
+Initializing the Ort::Session is a heavy operation that compiles the model graph for the specific GPU hardware. This must be performed during the plugin's obs_module_load or the source's create callback, never in the render loop.
+Configuration of the Ort::SessionOptions is critical for performance:
+Graph Optimization Level: Should be set to ORT_ENABLE_ALL to allow operator fusion.
+Execution Provider: The DirectML EP is appended using OrtSessionOptionsAppendExecutionProvider_DML. Crucially, this function accepts a pointer to the ID3D12Device. Passing the specific device created by the plugin allows ORT to share the context, enabling the shared resource interop described in Section 3.13
+
+C++
+
+
+// Conceptual Initialization Logic
+Ort::SessionOptions options;
+options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+options.DisableMemPattern(); // Recommended for DirectML to reduce allocation overhead
+OrtSessionOptionsAppendExecutionProvider_DML(options, d3d12_device_ptr);
+session = std::make_unique<Ort::Session>(env, model_path, options);
+
+
+5. The Data Pipeline: Preprocessing with Compute Shaders
+Neural networks rarely consume data in the format provided by graphics APIs. This mismatch necessitates a high-performance preprocessing stage.
+5.1 The Layout Conundrum: RGBA vs. NCHW
+Textures in DirectX 11 are typically stored in RGBA (or BGRA) format. This is a "packed" or "interleaved" layout where the Red, Green, Blue, and Alpha components of a single pixel are adjacent in memory.
+Memory Layout (RGBA): R1 G1 B1 A1 R2 G2 B2 A2...
+However, the vast majority of ONNX models (trained in PyTorch or TensorFlow) expect data in NCHW (Batch, Channels, Height, Width) format. This is a "planar" layout.
+Memory Layout (NCHW): R1 R2 R3... G1 G2 G3... B1 B2 B3...
+Additionally, models usually require normalization (e.g., subtracting a mean and dividing by standard deviation) and data casting from 8-bit integers (0-255) to 32-bit floating points (0.0f - 1.0f).
+5.2 The HLSL Compute Shader Solution
+Performing this transposition (Packed to Planar) on the CPU is highly inefficient due to cache thrashing. The optimal approach is to utilize an HLSL Compute Shader running on the D3D12 context. This shader treats the input RGBA texture as a read-only resource and writes to a generic RWStructuredBuffer or RWTexture2D that represents the input tensor of the model.15
+5.2.1 Shader Logic
+The Compute Shader is dispatched with thread groups covering the image dimensions (e.g., 8x8 blocks). Each thread reads one pixel and writes to three distinct locations in the output buffer (one for each color plane).
+The mathematical transformation performed by the shader is:
+
+
+
+Where , , and  are calculated based on the NCHW stride logic:
+
+
+
+By implementing this in HLSL, the conversion happens in microseconds, leveraging the massive parallelism of the GPU.17
+5.3 IO Binding for Zero-Copy Inference
+Once the data is prepared in the D3D12 resource, it must be bound to the ONNX Runtime session. Standard session.Run calls often implicitly copy data. To enforce zero-copy, the plugin must use Ort::IoBinding.
+The Ort::IoBinding API allows the developer to explicitly state: "The input tensor 'Input_0' is located at this specific memory address on the GPU." The plugin wraps the D3D12 resource (the output of the compute shader) into an Ort::Value and binds it. This ensures that when the inference executes, the operators read directly from the VRAM buffer prepared by the compute shader.
+6. Advanced Threading and Latency Management
+Given the real-time constraints of broadcasting, the temporal architecture of the plugin is as critical as the spatial (memory) architecture.
+6.1 The Fallacy of Synchronous Inference
+If the video_render callback blocks while waiting for the GPU to finish inference, the OBS frame rate will plummet. A complex background removal model might take 15-30ms on a mid-range GPU. If the render loop waits, the effective frame rate drops to 30-45 FPS, causing visible stutter.
+6.2 Asynchronous Worker Pattern
+To maintain 60 FPS, the plugin must decouple submission from presentation.
+Submission: In video_render, the plugin copies the current OBS frame to a free slot in a "Input Ring Buffer". It then signals a worker thread.
+Inference (Worker Thread): The worker thread wakes up, grabs the frame from the ring buffer, performs the D3D11->D3D12 sync, runs the Compute Shader, runs the ONNX Session, and runs the Post-Processing Shader. The result is placed in an "Output Ring Buffer".
+Presentation: In the next video_render call, the plugin checks the Output Ring Buffer. If a frame is ready, it is drawn. If not, the plugin can either repeat the last frame or draw the raw input (depending on user preference).
+This pipeline introduces a latency of 1-2 frames (approx. 33ms) but ensures the throughput remains at 60 FPS. The viewer sees smooth video, slightly delayed, which is acceptable for streaming (OBS automatically handles audio sync offsets to compensate if configured).
+6.3 Ring Buffer Implementation Details
+The ring buffers should consist of "Context Objects," where each object owns its own set of D3D11/D3D12 resources (Interop textures, Keyed Mutexes). This prevents the OBS thread from writing to a texture that the DML thread is currently reading. A buffer depth of 3 usually offers the best balance between memory usage and jitter absorption.
+7. Debugging, Profiling, and Reliability
+Developing native graphics plugins is prone to stability issues that can crash the entire streaming application. Robust debugging practices are essential.
+7.1 Visual Studio "Attach to Process"
+Since the plugin is a DLL loaded by obs64.exe, standard F5 debugging requires configuration.
+Launch OBS: Start OBS Studio independently.
+Attach: In Visual Studio 2022, use Debug > Attach to Process. Filter for obs64.exe.
+Code Type: Ensure "Native" code is selected. If the plugin uses C++/CLI (rare but possible), "Mixed" mode is required.
+Breakpoints: Breakpoints in obs_module_load may be missed if attached too late. For startup debugging, configure the Visual Studio project "Command" to point to the obs64.exe binary and "Working Directory" to the OBS executable folder.18
+7.2 Handling "Device Lost" (DXGI_ERROR_DEVICE_REMOVED)
+DirectX 12 is less forgiving than DX11. If the GPU hangs (TDR) due to a long-running inference shader, or if the user updates drivers while OBS is open, the device will be "lost."
+The plugin must check the HRESULT of every Present, Signal, or Wait call. If DXGI_ERROR_DEVICE_REMOVED is detected:
+Teardown: Immediately release all D3D12 resources, heaps, and the ONNX Runtime session.
+Re-initialize: Attempt to recreate the D3D12 device and reload the model.
+Fallback: If recovery fails, disable the filter gracefully (passing through original video) rather than crashing OBS.10
+7.3 GPU Profiling
+Standard CPU profilers tell little about GPU bottlenecks. NVIDIA Nsight Graphics or Microsoft PIX must be used to analyze the execution.
+Timeline Analysis: Verify that the Compute Shader dispatch and DirectML dispatch are actually overlapping or executing efficiently on the compute queue.
+Barrier Stalls: Check if the D3D12 pipeline is stalling excessively waiting for the Keyed Mutex release from D3D11.
+8. Deployment and Future Outlook
+8.1 Installer Logic
+Because the plugin relies on loose DLLs (onnxruntime.dll, DirectML.dll) that must sit alongside the plugin binary, a simple copy-paste installation is error-prone. A standard installer (Inno Setup or MSI) should be created to place files in the correct obs-plugins/64bit directory. The installer should not overwrite system DLLs.
+8.2 The Rise of NPUs
+Windows 11 (Version 24H2) represents a turning point with native NPU support. By building on DirectML, the plugin is theoretically forward-compatible with NPUs from Intel (Core Ultra) and AMD (Ryzen AI). If the NPU driver exposes a DirectML-compatible command queue, the plugin can target it by enumerating adapters and selecting the NPU. This would offload the inference entirely from the GPU, preserving maximum gaming performance for the streamer.1
+8.3 WinML vs. DirectML
+While Microsoft promotes Windows ML (WinML), DirectML remains the superior choice for OBS plugins. WinML enforces a WinRT surface area that is difficult to manage within a pure C application like OBS. DirectML allows the developer to stay within the C++ COM paradigms of DirectX, maintaining tighter integration with the existing rendering code and avoiding the "apartment threading" complexities of WinRT.
+9. Conclusion
+The development of an ONNX Runtime DirectML plugin for OBS Studio represents a sophisticated exercise in systems engineering. It requires bridging the legacy but reliable world of OBS's D3D11 architecture with the high-performance, forward-looking world of D3D12 and AI. The "Zero-Copy" pipeline, enabled by shared NT handles and HLSL compute shaders, is the non-negotiable foundation of a viable solution.
+By strictly adhering to the architectural patterns outlined in this report—asynchronous worker threads, keyed mutex synchronization, and local dependency isolation—developers can deliver professional-grade AI features. These capabilities not only enhance the production value of broadcasts but do so with a computational efficiency that respects the hardware limitations of the user's streaming machine. As the Windows AI ecosystem matures, this DirectML-based foundation positions the plugin to leverage emerging hardware accelerations seamlessly, ensuring relevance in the next generation of content creation.
+10. Technical Appendix: Reference Data
+Table 2: Comparison of Preprocessing Approaches
+Feature
+CPU Preprocessing
+Compute Shader (HLSL)
+Execution Context
+System RAM (Host)
+VRAM (Device)
+Data Movement
+PCIe Roundtrip (GPU->CPU->GPU)
+On-Chip / VRAM only
+Latency (1080p)
+10ms - 25ms
+0.1ms - 0.5ms
+Complexity
+Low (Simple loop)
+High (Shader, Dispatch, Sync)
+Throughput Impact
+High (Memory Bandwidth Saturation)
+Negligible (Parallel Compute)
+Preferred For
+Prototyping / Low Res
+Real-time / 60 FPS / 4K
+
+Table 3: Critical Direct3D/DXGI Flags for Interop
+Flag
+Value
+Purpose
+NTHANDLE
+D3D11_RESOURCE_MISC_SHARED_NTHANDLE
+Enables secure NT handle creation (CreateSharedHandle). Required for Win11 interop.
+KEYEDMUTEX
+D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX
+Enables AcquireSync/ReleaseSync. Mandatory for synchronization between separate devices/queues.
+BIND_UAV
+D3D11_BIND_UNORDERED_ACCESS
+Allows the texture to be written to by a Compute Shader (if doing preprocessing on D3D11 side, though D3D12 is preferred).
+ACCESS
+DXGI_SHARED_RESOURCE_READ | WRITE
+Permission flags used during CreateSharedHandle to define access rights for the consumer (D3D12).
+
+Sources des citations
+Get started with DirectML | Microsoft Learn, consulté le janvier 28, 2026, https://learn.microsoft.com/en-us/windows/ai/directml/dml-get-started
+Windows - DirectML | onnxruntime, consulté le janvier 28, 2026, https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html
+Windows | onnxruntime, consulté le janvier 28, 2026, https://onnxruntime.ai/docs/get-started/with-windows.html
+Source API Reference (obs_source_t) - OBS Studio's documentation!, consulté le janvier 28, 2026, https://docs.obsproject.com/reference-sources
+libobs/graphics/graphics.h · 0.11.3 · Yunxiang Li / obs-studio · GitLab, consulté le janvier 28, 2026, https://gitlab.uwaterloo.ca/y2497li/obs-studio/-/blob/0.11.3/libobs/graphics/graphics.h
+libobs - Rust, consulté le janvier 28, 2026, https://libobs-rs.github.io/libobs-rs/libobs/
+ONNX and DirectML execution provider guide - part 2 - AMD GPUOpen, consulté le janvier 28, 2026, https://gpuopen.com/learn/onnx-directlml-execution-provider-guide-part2/
+NVDEC decoded frame - trying a zero copy to NV12 d3d11 texture, consulté le janvier 28, 2026, https://forums.developer.nvidia.com/t/nvdec-decoded-frame-trying-a-zero-copy-to-nv12-d3d11-texture/123291
+ONNX versions and Windows builds | Microsoft Learn, consulté le janvier 28, 2026, https://learn.microsoft.com/en-us/windows/ai/windows-ml/onnx-versions
+OBS becomes unresponsive: device_texture_create (D3D11): Failed to create 2D texture, consulté le janvier 28, 2026, https://obsproject.com/forum/threads/obs-becomes-unresponsive-device_texture_create-d3d11-failed-to-create-2d-texture.166207/
+"GPU - DirectML" setting is broken in the latest release · Issue #272 · royshil/obs-backgroundremoval - GitHub, consulté le janvier 28, 2026, https://github.com/royshil/obs-backgroundremoval/issues/272
+obs-backgroundremoval - GitHub, consulté le janvier 28, 2026, https://github.com/obs-backgroundremoval
+DirectML/DxDispatch/doc/Guide.md at master - GitHub, consulté le janvier 28, 2026, https://github.com/microsoft/DirectML/blob/master/DxDispatch/doc/Guide.md
+NVIDIA TensorRT RTX Execution Provider - ONNX Runtime, consulté le janvier 28, 2026, https://onnxruntime.ai/docs/execution-providers/TensorRTRTX-ExecutionProvider.html
+ONNX and DirectML execution provider guide - part 1 - AMD GPUOpen, consulté le janvier 28, 2026, https://gpuopen.com/learn/onnx-directlml-execution-provider-guide-part1/
+Using strides to express padding and memory layout - Microsoft Learn, consulté le janvier 28, 2026, https://learn.microsoft.com/en-us/windows/ai/directml/dml-strides
+Passing colors through a pixel shader in HLSL - Stack Overflow, consulté le janvier 28, 2026, https://stackoverflow.com/questions/14760920/passing-colors-through-a-pixel-shader-in-hlsl
+Debug -> "Attach to Process" in Visual Studio 2022 Professional is not adding the Script file to the Solution Explorer - Microsoft Learn, consulté le janvier 28, 2026, https://learn.microsoft.com/en-us/answers/questions/5494981/debug-)-attach-to-process-in-visual-studio-2022-pr
+Debugging the Game - Dalamud.dev, consulté le janvier 28, 2026, https://dalamud.dev/faq/debug/
